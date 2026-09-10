@@ -1,10 +1,15 @@
-import {
-  createWebSearchProviderContractFields,
-  type WebSearchProviderPlugin,
-  type WebSearchProviderSetupContext,
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+// Xai plugin module implements web search behavior.
+import type {
+  WebSearchProviderPlugin,
+  WebSearchProviderSetupContext,
 } from "openclaw/plugin-sdk/provider-web-search-config-contract";
+import { buildXaiWebSearchProviderBase } from "./web-search-provider-shared.js";
 
-const XAI_CREDENTIAL_PATH = "plugins.entries.xai.config.webSearch.apiKey";
+const loadXaiWebSearchProviderRuntime = createLazyRuntimeModule(
+  () => import("./src/web-search-provider.runtime.js"),
+);
+
 const GenericXaiSearchSchema = {
   type: "object",
   properties: {
@@ -22,37 +27,22 @@ const GenericXaiSearchSchema = {
 async function runXaiSearchProviderSetup(
   ctx: WebSearchProviderSetupContext,
 ): Promise<WebSearchProviderSetupContext["config"]> {
-  const runtime = await import("./src/web-search-provider.runtime.js");
+  const runtime = await loadXaiWebSearchProviderRuntime();
   return await runtime.runXaiSearchProviderSetup(ctx);
 }
 
 export function createXaiWebSearchProvider(): WebSearchProviderPlugin {
   return {
-    id: "grok",
-    label: "Grok (xAI)",
-    hint: "Requires xAI API key · xAI web-grounded responses",
-    onboardingScopes: ["text-inference"],
-    credentialLabel: "xAI API key",
-    envVars: ["XAI_API_KEY"],
-    placeholder: "xai-...",
-    signupUrl: "https://console.x.ai/",
-    docsUrl: "https://docs.openclaw.ai/tools/web",
-    autoDetectOrder: 30,
-    credentialPath: XAI_CREDENTIAL_PATH,
-    ...createWebSearchProviderContractFields({
-      credentialPath: XAI_CREDENTIAL_PATH,
-      searchCredential: { type: "scoped", scopeId: "grok" },
-      configuredCredential: { pluginId: "xai" },
-    }),
+    ...buildXaiWebSearchProviderBase(),
     runSetup: runXaiSearchProviderSetup,
     createTool: (ctx) => ({
       description:
         "Search the web using xAI Grok. Returns AI-synthesized answers with citations from real-time web search.",
       parameters: GenericXaiSearchSchema,
-      execute: async (args) => {
-        const { executeXaiWebSearchProviderTool } =
-          await import("./src/web-search-provider.runtime.js");
-        return await executeXaiWebSearchProviderTool(ctx, args);
+      execute: async (args, executionContext) => {
+        executionContext?.signal?.throwIfAborted();
+        const { executeXaiWebSearchProviderTool } = await loadXaiWebSearchProviderRuntime();
+        return await executeXaiWebSearchProviderTool(ctx, args, executionContext);
       },
     }),
   };

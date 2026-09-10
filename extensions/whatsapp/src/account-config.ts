@@ -1,20 +1,27 @@
+// Whatsapp helper module supports account config behavior.
 import {
   DEFAULT_ACCOUNT_ID,
   resolveAccountEntry,
   resolveMergedAccountConfig,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/account-core";
-import {
-  resolveChannelStreamingBlockEnabled,
-  resolveChannelStreamingChunkMode,
-} from "openclaw/plugin-sdk/channel-streaming";
 import type { WhatsAppAccountConfig } from "./account-types.js";
 
-function _resolveWhatsAppAccountConfig(
+function resolveWhatsAppDefaultAccountSharedConfig(
   cfg: OpenClawConfig,
-  accountId: string,
-): WhatsAppAccountConfig | undefined {
-  return resolveAccountEntry(cfg.channels?.whatsapp?.accounts, accountId);
+): Partial<WhatsAppAccountConfig> | undefined {
+  const defaultAccount = resolveAccountEntry(cfg.channels?.whatsapp?.accounts, DEFAULT_ACCOUNT_ID);
+  if (!defaultAccount) {
+    return undefined;
+  }
+  const {
+    enabled: _ignoredEnabled,
+    name: _ignoredName,
+    authDir: _ignoredAuthDir,
+    selfChatMode: _ignoredSelfChatMode,
+    ...sharedDefaults
+  } = defaultAccount;
+  return sharedDefaults;
 }
 
 export function resolveMergedWhatsAppAccountConfig(params: {
@@ -24,15 +31,15 @@ export function resolveMergedWhatsAppAccountConfig(params: {
   const rootCfg = params.cfg.channels?.whatsapp;
   const accountId = params.accountId?.trim() || rootCfg?.defaultAccount || DEFAULT_ACCOUNT_ID;
   const merged = resolveMergedAccountConfig<WhatsAppAccountConfig>({
-    channelConfig: rootCfg as WhatsAppAccountConfig | undefined,
+    channelConfig: {
+      ...rootCfg,
+      ...(accountId === DEFAULT_ACCOUNT_ID
+        ? undefined
+        : resolveWhatsAppDefaultAccountSharedConfig(params.cfg)),
+    },
     accounts: rootCfg?.accounts as Record<string, Partial<WhatsAppAccountConfig>> | undefined,
     accountId,
     omitKeys: ["defaultAccount"],
   });
-  return {
-    accountId,
-    ...merged,
-    chunkMode: resolveChannelStreamingChunkMode(merged) ?? merged.chunkMode,
-    blockStreaming: resolveChannelStreamingBlockEnabled(merged) ?? merged.blockStreaming,
-  };
+  return { accountId, ...merged };
 }

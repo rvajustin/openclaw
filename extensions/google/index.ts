@@ -1,3 +1,4 @@
+// Google plugin entrypoint registers its OpenClaw integration.
 import type { ImageGenerationProvider } from "openclaw/plugin-sdk/image-generation";
 import type { MediaUnderstandingProvider } from "openclaw/plugin-sdk/media-understanding";
 import type { MusicGenerationProvider } from "openclaw/plugin-sdk/music-generation";
@@ -6,11 +7,13 @@ import type { VideoGenerationProvider } from "openclaw/plugin-sdk/video-generati
 import { buildGoogleGeminiCliBackend } from "./cli-backend.js";
 import { registerGoogleGeminiCliProvider } from "./gemini-cli-provider.js";
 import {
+  createGoogleImageGenerationProviderMetadata,
   createGoogleMusicGenerationProviderMetadata,
   createGoogleVideoGenerationProviderMetadata,
 } from "./generation-provider-metadata.js";
 import { geminiMemoryEmbeddingProviderAdapter } from "./memory-embedding-adapter.js";
 import { registerGoogleProvider } from "./provider-registration.js";
+import { createLazyGoogleRealtimeVoiceProvider } from "./realtime-voice-lazy.js";
 import { buildGoogleSpeechProvider } from "./speech-provider.js";
 import { createGeminiWebSearchProvider } from "./src/gemini-web-search-provider.js";
 
@@ -20,10 +23,7 @@ let googleMusicGenerationProviderPromise: Promise<MusicGenerationProvider> | nul
 let googleVideoGenerationProviderPromise: Promise<VideoGenerationProvider> | null = null;
 
 type GoogleMediaUnderstandingProvider = Required<
-  Pick<
-    MediaUnderstandingProvider,
-    "describeImage" | "describeImages" | "transcribeAudio" | "describeVideo"
-  >
+  Pick<MediaUnderstandingProvider, "transcribeAudio" | "describeVideo">
 >;
 
 async function loadGoogleImageGenerationProvider(): Promise<ImageGenerationProvider> {
@@ -64,12 +64,7 @@ async function loadGoogleVideoGenerationProvider(): Promise<VideoGenerationProvi
 
 async function loadGoogleRequiredMediaUnderstandingProvider(): Promise<GoogleMediaUnderstandingProvider> {
   const provider = await loadGoogleMediaUnderstandingProvider();
-  if (
-    !provider.describeImage ||
-    !provider.describeImages ||
-    !provider.transcribeAudio ||
-    !provider.describeVideo
-  ) {
+  if (!provider.transcribeAudio || !provider.describeVideo) {
     throw new Error("google media understanding provider missing required handlers");
   }
   return provider as GoogleMediaUnderstandingProvider;
@@ -77,31 +72,7 @@ async function loadGoogleRequiredMediaUnderstandingProvider(): Promise<GoogleMed
 
 function createLazyGoogleImageGenerationProvider(): ImageGenerationProvider {
   return {
-    id: "google",
-    label: "Google",
-    defaultModel: "gemini-3.1-flash-image-preview",
-    models: ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"],
-    capabilities: {
-      generate: {
-        maxCount: 4,
-        supportsSize: true,
-        supportsAspectRatio: true,
-        supportsResolution: true,
-      },
-      edit: {
-        enabled: true,
-        maxCount: 4,
-        maxInputImages: 5,
-        supportsSize: true,
-        supportsAspectRatio: true,
-        supportsResolution: true,
-      },
-      geometry: {
-        sizes: ["1024x1024", "1024x1536", "1536x1024", "1024x1792", "1792x1024"],
-        aspectRatios: ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
-        resolutions: ["1K", "2K", "4K"],
-      },
-    },
+    ...createGoogleImageGenerationProviderMetadata(),
     generateImage: async (req) => (await loadGoogleImageGenerationProvider()).generateImage(req),
   };
 }
@@ -117,10 +88,8 @@ function createLazyGoogleMediaUnderstandingProvider(): MediaUnderstandingProvide
     },
     autoPriority: { image: 30, audio: 40, video: 10 },
     nativeDocumentInputs: ["pdf"],
-    describeImage: async (...args) =>
-      await (await loadGoogleRequiredMediaUnderstandingProvider()).describeImage(...args),
-    describeImages: async (...args) =>
-      await (await loadGoogleRequiredMediaUnderstandingProvider()).describeImages(...args),
+    describeImage: undefined,
+    describeImages: undefined,
     transcribeAudio: async (...args) =>
       await (await loadGoogleRequiredMediaUnderstandingProvider()).transcribeAudio(...args),
     describeVideo: async (...args) =>
@@ -152,10 +121,11 @@ export default definePluginEntry({
     api.registerCliBackend(buildGoogleGeminiCliBackend());
     registerGoogleGeminiCliProvider(api);
     registerGoogleProvider(api);
-    api.registerMemoryEmbeddingProvider(geminiMemoryEmbeddingProviderAdapter);
+    api.registerEmbeddingProvider(geminiMemoryEmbeddingProviderAdapter);
     api.registerImageGenerationProvider(createLazyGoogleImageGenerationProvider());
     api.registerMediaUnderstandingProvider(createLazyGoogleMediaUnderstandingProvider());
     api.registerMusicGenerationProvider(createLazyGoogleMusicGenerationProvider());
+    api.registerRealtimeVoiceProvider(createLazyGoogleRealtimeVoiceProvider());
     api.registerSpeechProvider(buildGoogleSpeechProvider());
     api.registerVideoGenerationProvider(createLazyGoogleVideoGenerationProvider());
     api.registerWebSearchProvider(createGeminiWebSearchProvider());

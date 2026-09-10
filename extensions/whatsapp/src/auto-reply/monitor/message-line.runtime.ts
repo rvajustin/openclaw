@@ -1,4 +1,5 @@
-export { resolveMessagePrefix } from "openclaw/plugin-sdk/agent-runtime";
+// Whatsapp plugin module implements message line behavior.
+
 export {
   formatInboundEnvelope,
   type EnvelopeFormatOptions,

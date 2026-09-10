@@ -1,13 +1,24 @@
-import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../../agents/agent-scope.js";
-import { loadConfig } from "../../config/config.js";
-import { applyPluginAutoEnable } from "../../config/plugin-auto-enable.js";
+// Prepared plugin runtime load facts and registry-owned context access.
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { PluginInstallRecord } from "../../config/types.plugins.js";
 import { createSubsystemLogger } from "../../logging.js";
-import type { PluginLoadOptions } from "../loader.js";
+import { resolvePluginRegistrationConfigKey } from "../loader-registration-config.js";
+import type { PluginLoadOptions } from "../loader-types.js";
+import type { PluginManifestRegistry } from "../manifest-registry.js";
+import { resolvePluginControlPlaneFingerprint } from "../plugin-control-plane-context.js";
+import type { PluginMetadataSnapshot } from "../plugin-metadata-snapshot.types.js";
+import { buildDeclaredProviderOwnerIndex } from "../provider-owner-index.js";
+import type { PluginRegistry } from "../registry-types.js";
 import type { PluginLogger } from "../types.js";
+import {
+  bindPluginRuntimeLoadContextState,
+  getPluginRuntimeLoadContextState,
+  type PluginRuntimeLoadContextState,
+} from "./load-context-state.js";
 
 const log = createSubsystemLogger("plugins");
 
+/** Resolved plugin runtime load context shared by runtime loader callers. */
 export type PluginRuntimeLoadContext = {
   rawConfig: OpenClawConfig;
   config: OpenClawConfig;
@@ -16,21 +27,67 @@ export type PluginRuntimeLoadContext = {
   workspaceDir: string | undefined;
   env: NodeJS.ProcessEnv;
   logger: PluginLogger;
+  manifestRegistry?: PluginManifestRegistry;
+  metadataSnapshot?: PluginMetadataSnapshot;
+  installRecords?: Record<string, PluginInstallRecord>;
+  preferBuiltPluginArtifacts?: boolean;
 };
 
-export type PluginRuntimeResolvedLoadValues = Pick<
+export function setPluginRuntimeLoadContext(
+  registry: PluginRegistry,
+  context: PluginRuntimeLoadContext,
+  registrationConfigKey?: string,
+  loaderCacheIdentity?: PluginRuntimeLoadContextState["loaderCacheIdentity"],
+): void {
+  const previous = getPluginRuntimeLoadContextState(registry);
+  const capturedIdentity = previous?.loaderCacheIdentity ?? loaderCacheIdentity;
+  const bound = {
+    ...context,
+    ...(capturedIdentity ? { loaderCacheIdentity: capturedIdentity } : {}),
+    // Host preparation may rebind metadata, but it cannot change already-registered closures.
+    registrationConfigKey:
+      previous?.registrationConfigKey ??
+      registrationConfigKey ??
+      resolvePluginRegistrationConfigKey(context),
+    declaredProviderOwners:
+      context.metadataSnapshot &&
+      context.metadataSnapshot.manifestRegistry === context.manifestRegistry
+        ? context.metadataSnapshot.declaredProviderOwners
+        : buildDeclaredProviderOwnerIndex(context.manifestRegistry?.plugins ?? []),
+    // Capture selection before caller-owned config or environment objects can change.
+    controlPlaneFingerprint: resolvePluginControlPlaneFingerprint({
+      config: context.rawConfig,
+      env: context.env,
+      workspaceDir: context.workspaceDir,
+    }),
+  };
+  bindPluginRuntimeLoadContextState(registry, bound);
+}
+
+/** Reads load facts carried by an exact lifecycle-owned registry. */
+export const getPluginRuntimeLoadContext = (
+  registry: object | undefined,
+): (PluginRuntimeLoadContext & PluginRuntimeLoadContextState) | undefined =>
+  // SAFETY: setPluginRuntimeLoadContext is the sole writer and supplies all load facts.
+  getPluginRuntimeLoadContextState(registry) as
+    | (PluginRuntimeLoadContext & PluginRuntimeLoadContextState)
+    | undefined;
+
+/** Runtime load option values that can be passed directly to plugin loading. */
+type PluginRuntimeResolvedLoadValues = Pick<
   PluginLoadOptions,
-  "config" | "activationSourceConfig" | "autoEnabledReasons" | "workspaceDir" | "env" | "logger"
+  | "config"
+  | "activationSourceConfig"
+  | "autoEnabledReasons"
+  | "workspaceDir"
+  | "env"
+  | "logger"
+  | "manifestRegistry"
+  | "installRecords"
+  | "preferBuiltPluginArtifacts"
 >;
 
-export type PluginRuntimeLoadContextOptions = {
-  config?: OpenClawConfig;
-  activationSourceConfig?: OpenClawConfig;
-  env?: NodeJS.ProcessEnv;
-  workspaceDir?: string;
-  logger?: PluginLogger;
-};
-
+/** Creates the default plugin runtime loader logger. */
 export function createPluginRuntimeLoaderLogger(): PluginLogger {
   return {
     info: (message) => log.info(message),
@@ -40,34 +97,8 @@ export function createPluginRuntimeLoaderLogger(): PluginLogger {
   };
 }
 
-export function resolvePluginRuntimeLoadContext(
-  options?: PluginRuntimeLoadContextOptions,
-): PluginRuntimeLoadContext {
-  const env = options?.env ?? process.env;
-  const rawConfig = options?.config ?? loadConfig();
-  const autoEnabled = applyPluginAutoEnable({ config: rawConfig, env });
-  const config = autoEnabled.config;
-  const workspaceDir =
-    options?.workspaceDir ?? resolveAgentWorkspaceDir(config, resolveDefaultAgentId(config));
-  return {
-    rawConfig,
-    config,
-    activationSourceConfig: options?.activationSourceConfig ?? rawConfig,
-    autoEnabledReasons: autoEnabled.autoEnabledReasons,
-    workspaceDir,
-    env,
-    logger: options?.logger ?? createPluginRuntimeLoaderLogger(),
-  };
-}
-
+/** Projects explicit runtime load fields from prepared contexts or resolved values. */
 export function buildPluginRuntimeLoadOptions(
-  context: PluginRuntimeLoadContext,
-  overrides?: Partial<PluginLoadOptions>,
-): PluginLoadOptions {
-  return buildPluginRuntimeLoadOptionsFromValues(context, overrides);
-}
-
-export function buildPluginRuntimeLoadOptionsFromValues(
   values: PluginRuntimeResolvedLoadValues,
   overrides?: Partial<PluginLoadOptions>,
 ): PluginLoadOptions {
@@ -78,6 +109,9 @@ export function buildPluginRuntimeLoadOptionsFromValues(
     workspaceDir: values.workspaceDir,
     env: values.env,
     logger: values.logger,
+    manifestRegistry: values.manifestRegistry,
+    installRecords: values.installRecords,
+    preferBuiltPluginArtifacts: values.preferBuiltPluginArtifacts,
     ...overrides,
   };
 }

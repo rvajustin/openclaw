@@ -1,22 +1,28 @@
+// Shared Vitest mock harness for channel command config and secret resolution.
 import { vi } from "vitest";
 import type { MockFn } from "../test-utils/vitest-mock-fn.js";
 
-function buildBundledPluginModuleId(pluginId: string, artifactBasename: string): string {
-  return ["..", "..", "extensions", pluginId, artifactBasename].join("/");
-}
-
 const readConfigFileSnapshotMock = vi.fn() as unknown as MockFn;
+const readConfigFileSnapshotForWriteMock = vi.fn(async () => {
+  const snapshot = await readConfigFileSnapshotMock();
+  return {
+    snapshot: { ...snapshot, sourceConfig: snapshot.sourceConfig ?? snapshot.config },
+    writeOptions: {},
+  };
+}) as unknown as MockFn;
 const writeConfigFileMock = vi.fn().mockResolvedValue(undefined) as unknown as MockFn;
-const replaceConfigFileMock = vi.fn(async (params: { nextConfig: unknown }) => {
-  await writeConfigFileMock(params.nextConfig);
+const replaceConfigFileMock = vi.fn(async (params: { sourceConfig: unknown }) => {
+  await writeConfigFileMock(params.sourceConfig);
 }) as unknown as MockFn;
 
 export const configMocks: {
   readConfigFileSnapshot: MockFn;
+  readConfigFileSnapshotForWrite: MockFn;
   writeConfigFile: MockFn;
   replaceConfigFile: MockFn;
 } = {
   readConfigFileSnapshot: readConfigFileSnapshotMock,
+  readConfigFileSnapshotForWrite: readConfigFileSnapshotForWriteMock,
   writeConfigFile: writeConfigFileMock,
   replaceConfigFile: replaceConfigFileMock,
 };
@@ -25,6 +31,12 @@ export const offsetMocks: {
   deleteTelegramUpdateOffset: MockFn;
 } = {
   deleteTelegramUpdateOffset: vi.fn().mockResolvedValue(undefined) as unknown as MockFn,
+};
+
+export const lifecycleMocks: {
+  onAccountConfigChanged: MockFn;
+} = {
+  onAccountConfigChanged: vi.fn().mockResolvedValue(undefined) as unknown as MockFn,
 };
 
 export const secretMocks = {
@@ -37,6 +49,7 @@ export const secretMocks = {
 
 vi.mock("../config/config.js", () => ({
   readConfigFileSnapshot: configMocks.readConfigFileSnapshot,
+  readConfigFileSnapshotForWrite: configMocks.readConfigFileSnapshotForWrite,
   writeConfigFile: configMocks.writeConfigFile,
   replaceConfigFile: configMocks.replaceConfigFile,
 }));
@@ -47,8 +60,4 @@ vi.mock("../cli/command-config-resolution.js", () => ({
 
 vi.mock("../cli/command-secret-targets.js", () => ({
   getChannelsCommandSecretTargetIds: () => new Set<string>(),
-}));
-
-vi.mock(buildBundledPluginModuleId("telegram", "update-offset-runtime-api.js"), () => ({
-  deleteTelegramUpdateOffset: offsetMocks.deleteTelegramUpdateOffset,
 }));

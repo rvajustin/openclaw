@@ -1,67 +1,136 @@
-import { resolveChannelDefaultAccountId } from "../../channels/plugins/helpers.js";
+// Implements guided and non-interactive disable/delete for channel accounts.
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
-  getChannelPlugin,
-  listChannelPlugins,
-  normalizeChannelId,
-} from "../../channels/plugins/index.js";
-import { replaceConfigFile, type OpenClawConfig } from "../../config/config.js";
+  applyPreparedChannelAccountRemoval,
+  type ChannelAccountMutationPlugin,
+  prepareChannelAccountRemoval,
+} from "../../channels/plugins/account-config-mutation.js";
+import { getChannelPlugin, normalizeChannelId } from "../../channels/plugins/index.js";
+import { listReadOnlyChannelPluginsForConfig } from "../../channels/plugins/read-only.js";
+import { formatCliCommand } from "../../cli/command-format.js";
+import {
+  formatUnknownChannelMessage,
+  formatUnsupportedChannelActionMessage,
+} from "../../cli/error-format.js";
+import type { OpenClawConfig } from "../../config/config.js";
+import { callGateway } from "../../gateway/call.js";
+import { formatErrorMessage } from "../../infra/errors.js";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "../../routing/session-key.js";
 import { defaultRuntime, type RuntimeEnv } from "../../runtime.js";
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
+import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../../utils/message-channel.js";
 import { createClackPrompter } from "../../wizard/clack-prompter.js";
-import {
-  type ChatChannel,
-  channelLabel,
-  requireValidConfigFileSnapshot,
-  shouldUseWizard,
-} from "./shared.js";
+import { parseAccountSelector } from "./account-selector.js";
+import { persistChannelPluginConfig } from "./plugin-config-persistence.js";
+import { channelLabel } from "./runtime-label.js";
+import { type ChatChannel, requireValidConfigForWrite, shouldUseWizard } from "./shared.js";
 
 export type ChannelsRemoveOptions = {
+  agent?: string;
   channel?: string;
   account?: string;
   delete?: boolean;
 };
 
-function listAccountIds(cfg: OpenClawConfig, channel: ChatChannel): string[] {
-  const plugin = getChannelPlugin(channel);
+function listAccountIds(
+  cfg: OpenClawConfig,
+  channel: ChatChannel,
+  pluginInput?: ChannelAccountMutationPlugin,
+): string[] {
+  let plugin = pluginInput;
+  plugin ??= getChannelPlugin(channel);
   if (!plugin) {
     return [];
   }
   return plugin.config.listAccountIds(cfg);
 }
 
+function formatAccountRemovalErrorMessage(params: {
+  channel: ChatChannel;
+  kind: "unknown-account" | "nothing-to-remove";
+  accountId: string;
+  requestedAccount: string | undefined;
+  accountIds: readonly string[];
+}): string {
+  const label = channelLabel(params.channel);
+  const inspect = `Run ${formatCliCommand(`openclaw channels status --channel ${params.channel}`)} to inspect configured accounts.`;
+  const known = params.accountIds.length ? ` Known accounts: ${params.accountIds.join(", ")}.` : "";
+  if (params.kind === "nothing-to-remove") {
+    return `${label} account "${params.accountId}" has no configuration to delete.${known} ${inspect}`;
+  }
+  if (!params.requestedAccount) {
+    return `${label} has no ${DEFAULT_ACCOUNT_ID} account to remove.${known} Name an account with ${formatCliCommand("--account <id>")}. ${inspect}`;
+  }
+  return `${label} has no account "${params.requestedAccount}" to remove.${known} ${inspect}`;
+}
+
+async function stopGatewayRuntimeBeforeRemove(params: {
+  cfg: OpenClawConfig;
+  channel: ChatChannel;
+  accountId: string;
+  shouldStopRuntime: boolean;
+  runtime: RuntimeEnv;
+}) {
+  if (!params.shouldStopRuntime) {
+    return;
+  }
+  try {
+    await callGateway({
+      config: params.cfg,
+      method: "channels.stop",
+      params: {
+        channel: params.channel,
+        accountId: params.accountId,
+      },
+      mode: GATEWAY_CLIENT_MODES.BACKEND,
+      clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
+      deviceIdentity: null,
+    });
+  } catch (error) {
+    params.runtime.log(
+      `Could not stop running ${channelLabel(params.channel)} account "${params.accountId}" before removing it: ${formatErrorMessage(error)}`,
+    );
+  }
+}
+
+/** Disable or delete a channel account, stopping gateway runtime state before mutation. */
 export async function channelsRemoveCommand(
   opts: ChannelsRemoveOptions,
   runtime: RuntimeEnv = defaultRuntime,
   params?: { hasFlags?: boolean },
 ) {
-  const configSnapshot = await requireValidConfigFileSnapshot(runtime);
-  if (!configSnapshot) {
+  parseAccountSelector(opts.account);
+  const writeSnapshot = await requireValidConfigForWrite(runtime);
+  if (!writeSnapshot) {
     return;
   }
-  const baseHash = configSnapshot.hash;
-  let cfg = (configSnapshot.sourceConfig ?? configSnapshot.config) as OpenClawConfig;
+  const cfg: OpenClawConfig = writeSnapshot.snapshot.sourceConfig;
 
   const useWizard = shouldUseWizard(params);
   const prompter = useWizard ? createClackPrompter() : null;
   const rawChannel = normalizeOptionalString(opts.channel) ?? "";
+  let lookupChannel = rawChannel;
   let channel: ChatChannel | null = normalizeChannelId(rawChannel);
   let accountId = normalizeAccountId(opts.account);
   const deleteConfig = Boolean(opts.delete);
 
   if (useWizard && prompter) {
     await prompter.intro("Remove channel account");
+    const readOnlyPlugins = listReadOnlyChannelPluginsForConfig(cfg, {
+      includeSetupFallbackPlugins: true,
+    });
     const selectedChannel = await prompter.select({
       message: "Channel",
-      options: listChannelPlugins().map((plugin) => ({
+      options: readOnlyPlugins.map((plugin) => ({
         value: plugin.id,
         label: plugin.meta.label,
       })),
     });
     channel = selectedChannel;
+    lookupChannel = selectedChannel;
 
     accountId = await (async () => {
-      const ids = listAccountIds(cfg, selectedChannel);
+      const readOnlyPlugin = readOnlyPlugins.find((plugin) => plugin.id === selectedChannel);
+      const ids = listAccountIds(cfg, selectedChannel, readOnlyPlugin);
       const choice = await prompter.select({
         message: "Account",
         options: ids.map((id) => ({
@@ -83,7 +152,9 @@ export async function channelsRemoveCommand(
     }
   } else {
     if (!rawChannel) {
-      runtime.error("Channel is required. Use --channel <name>.");
+      runtime.error(
+        `Missing channel. Use ${formatCliCommand("openclaw channels remove --channel <name>")} or run ${formatCliCommand("openclaw channels status")} to inspect configured channels.`,
+      );
       runtime.exit(1);
       return;
     }
@@ -100,8 +171,7 @@ export async function channelsRemoveCommand(
     }
   }
 
-  const shouldResolveInstallablePlugin =
-    !useWizard && rawChannel && (!channel || !getChannelPlugin(channel));
+  const shouldResolveInstallablePlugin = Boolean(lookupChannel || channel);
   const resolvedPluginState = shouldResolveInstallablePlugin
     ? await (async () => {
         const { resolveInstallableChannelPlugin } =
@@ -109,83 +179,94 @@ export async function channelsRemoveCommand(
         return await resolveInstallableChannelPlugin({
           cfg,
           runtime,
-          rawChannel,
-          allowInstall: true,
+          agentId: opts.agent,
+          rawChannel: lookupChannel,
+          allowInstall: false,
         });
       })()
     : null;
-  if (resolvedPluginState?.configChanged) {
-    cfg = resolvedPluginState.cfg;
-  }
   const resolvedChannel = resolvedPluginState?.channelId ?? channel;
   if (!resolvedChannel) {
-    runtime.error(`Unknown channel: ${rawChannel}`);
+    runtime.error(formatUnknownChannelMessage({ channel: rawChannel }));
     runtime.exit(1);
     return;
   }
   channel = resolvedChannel;
   const plugin = resolvedPluginState?.plugin ?? getChannelPlugin(resolvedChannel);
   if (!plugin) {
-    runtime.error(`Unknown channel: ${resolvedChannel}`);
+    if (resolvedPluginState?.catalogEntry) {
+      runtime.error(
+        `Channel plugin "${resolvedPluginState.catalogEntry.id}" is not installed. Run ${formatCliCommand(`openclaw channels add --channel ${resolvedPluginState.catalogEntry.id}`)} first.`,
+      );
+      runtime.exit(1);
+      return;
+    }
+    runtime.error(formatUnknownChannelMessage({ channel: resolvedChannel }));
     runtime.exit(1);
     return;
   }
   const resolvedChannelId: ChatChannel = resolvedChannel;
-  const resolvedAccountId =
-    normalizeAccountId(accountId) ?? resolveChannelDefaultAccountId({ plugin, cfg });
-  const accountKey = resolvedAccountId || DEFAULT_ACCOUNT_ID;
+  const preparedRemoval = prepareChannelAccountRemoval({
+    plugin,
+    accountId,
+    action: deleteConfig ? "delete" : "disable",
+  });
 
-  let next = { ...cfg };
-  const prevCfg = cfg;
-  if (deleteConfig) {
-    if (!plugin.config.deleteAccount) {
-      runtime.error(`Channel ${channel} does not support delete.`);
+  await stopGatewayRuntimeBeforeRemove({
+    cfg,
+    channel: resolvedChannelId,
+    accountId: preparedRemoval.accountKey,
+    shouldStopRuntime: preparedRemoval.shouldStopRuntime,
+    runtime,
+  });
+
+  const removal = await applyPreparedChannelAccountRemoval({
+    cfg,
+    prepared: preparedRemoval,
+    runtime,
+  });
+  if (!removal.ok) {
+    if (removal.error.kind !== "unsupported-action") {
+      runtime.error(
+        formatAccountRemovalErrorMessage({
+          channel: resolvedChannelId,
+          kind: removal.error.kind,
+          accountId: preparedRemoval.accountKey,
+          requestedAccount: useWizard
+            ? preparedRemoval.accountKey
+            : normalizeOptionalString(opts.account),
+          accountIds: removal.error.accountIds,
+        }),
+      );
       runtime.exit(1);
       return;
     }
-    next = plugin.config.deleteAccount({
-      cfg: next,
-      accountId: resolvedAccountId,
-    });
-    await plugin.lifecycle?.onAccountRemoved?.({
-      prevCfg,
-      accountId: resolvedAccountId,
-      runtime,
-    });
-  } else {
-    if (!plugin.config.setAccountEnabled) {
-      runtime.error(`Channel ${channel} does not support disable.`);
-      runtime.exit(1);
-      return;
-    }
-    next = plugin.config.setAccountEnabled({
-      cfg: next,
-      accountId: resolvedAccountId,
-      enabled: false,
-    });
-    await plugin.lifecycle?.onAccountConfigChanged?.({
-      prevCfg,
-      nextCfg: next,
-      accountId: resolvedAccountId,
-      runtime,
-    });
+    runtime.error(
+      removal.error.action === "delete"
+        ? `${formatUnsupportedChannelActionMessage({ channel, action: "delete" })} Use ${formatCliCommand("openclaw channels remove --channel " + channel)} to disable it without deleting config.`
+        : `${formatUnsupportedChannelActionMessage({ channel, action: "disable" })} Use ${formatCliCommand("openclaw channels remove --channel " + channel + " --delete")} only if you want to remove config.`,
+    );
+    runtime.exit(1);
+    return;
   }
-
-  await replaceConfigFile({
-    nextConfig: next,
-    ...(baseHash !== undefined ? { baseHash } : {}),
+  await persistChannelPluginConfig({
+    cfg: removal.value.nextConfig,
+    pluginInstalled: false,
+    writeOptions: writeSnapshot.writeOptions,
+    baseHash: writeSnapshot.snapshot.hash,
+    runtime,
   });
   if (useWizard && prompter) {
     await prompter.outro(
       deleteConfig
-        ? `Deleted ${channelLabel(resolvedChannelId)} account "${accountKey}".`
-        : `Disabled ${channelLabel(resolvedChannelId)} account "${accountKey}".`,
+        ? `Deleted ${channelLabel(resolvedChannelId)} account "${preparedRemoval.accountKey}".`
+        : `Disabled ${channelLabel(resolvedChannelId)} account "${preparedRemoval.accountKey}".`,
     );
   } else {
     runtime.log(
       deleteConfig
-        ? `Deleted ${channelLabel(resolvedChannelId)} account "${accountKey}".`
-        : `Disabled ${channelLabel(resolvedChannelId)} account "${accountKey}".`,
+        ? `Deleted ${channelLabel(resolvedChannelId)} account "${preparedRemoval.accountKey}".`
+        : `Disabled ${channelLabel(resolvedChannelId)} account "${preparedRemoval.accountKey}".`,
     );
   }
 }

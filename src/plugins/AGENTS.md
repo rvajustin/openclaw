@@ -68,6 +68,25 @@ assembly, and contract enforcement.
 - If setup, discovery, or doctor flows need plugin runtime, make that need
   explicit and narrow. Do not let cold control-plane paths quietly import broad
   runtime surfaces.
+- Resolver and public-surface loader tests must use generated tiny plugin
+  fixtures for broad `api.js` / `runtime-api.js` fallback behavior. Do not point
+  those tests at real bundled plugin source APIs just to prove path resolution.
+
+## Availability And Selection
+
+- Gateway plugin metadata is stable while the Gateway runs. Reuse current
+  snapshots, install records, discovery, lookup tables, and bounded process
+  caches; avoid per-call stat/read/hash freshness. Metadata changes require
+  restart or the plugin owner's explicit reload/install/doctor flow. Keep caches
+  lifecycle-owned and test-clearable, not broad persistent stores.
+- Repeated availability checks and catalog selection consume prepared local
+  facts. Remote catalog discovery and provider probes belong to initialization
+  or the owner's refresh operation, not each request or UI render. A second
+  request-time cache or polling loop is not the fix for repeated discovery.
+- Keep configured/eligible state distinct from live health. A present credential
+  or cached descriptor does not prove a service is reachable. Explicit health
+  probes, credential refresh, and actual provider/tool execution retain their
+  network contracts.
 
 ## Verification
 
@@ -75,4 +94,4 @@ assembly, and contract enforcement.
   change bundled plugin import fanout, run `pnpm build`.
 - If the change can alter bundled plugin startup cost, re-profile the affected
   plugin entrypoint with:
-  `OPENCLAW_LOCAL_CHECK=0 node scripts/profile-extension-memory.mjs --extension <id> --skip-combined --concurrency 1`
+  `OPENCLAW_LOCAL_CHECK=0 node --import tsx scripts/profile-extension-memory.mts --extension <id> --skip-combined --concurrency 1`

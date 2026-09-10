@@ -1,25 +1,32 @@
+// Telegram plugin module implements accounts behavior.
 import util from "node:util";
 import {
   createAccountActionGate,
   normalizeAccountId,
   normalizeOptionalAccountId,
-  resolveAccountEntry,
   resolveAccountWithDefaultFallback,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/account-core";
 import type {
   TelegramAccountConfig,
   TelegramActionConfig,
-} from "openclaw/plugin-sdk/config-runtime";
+} from "openclaw/plugin-sdk/config-contracts";
 import { formatSetExplicitDefaultInstruction } from "openclaw/plugin-sdk/routing";
 import { createSubsystemLogger, isTruthyEnvValue } from "openclaw/plugin-sdk/runtime-env";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { mergeTelegramAccountConfig, resolveTelegramAccountConfig } from "./account-config.js";
 import {
   listTelegramAccountIds as listSelectedTelegramAccountIds,
   resolveDefaultTelegramAccountSelection,
 } from "./account-selection.js";
 import type { TelegramTransport } from "./fetch.js";
 import { resolveTelegramToken } from "./token.js";
+
+type CredentialUnavailableDiagnostic = NonNullable<
+  ReturnType<typeof resolveTelegramToken>["credentialDiagnostics"]
+>[number];
+
+export { mergeTelegramAccountConfig, resolveTelegramAccountConfig } from "./account-config.js";
 
 let log: ReturnType<typeof createSubsystemLogger> | null = null;
 
@@ -53,6 +60,8 @@ export type ResolvedTelegramAccount = {
   name?: string;
   token: string;
   tokenSource: "env" | "tokenFile" | "config" | "none";
+  tokenStatus: "available" | "configured_unavailable" | "missing";
+  credentialDiagnostics?: CredentialUnavailableDiagnostic[];
   config: TelegramAccountConfig;
 };
 
@@ -87,43 +96,6 @@ export function resolveDefaultTelegramAccountId(cfg: OpenClawConfig): string {
     );
   }
   return selection.accountId;
-}
-
-export function resolveTelegramAccountConfig(
-  cfg: OpenClawConfig,
-  accountId: string,
-): TelegramAccountConfig | undefined {
-  const normalized = normalizeAccountId(accountId);
-  return resolveAccountEntry(cfg.channels?.telegram?.accounts, normalized);
-}
-
-export function mergeTelegramAccountConfig(
-  cfg: OpenClawConfig,
-  accountId: string,
-): TelegramAccountConfig {
-  const {
-    accounts: _ignored,
-    defaultAccount: _ignoredDefaultAccount,
-    groups: channelGroups,
-    ...base
-  } = (cfg.channels?.telegram ?? {}) as TelegramAccountConfig & {
-    accounts?: unknown;
-    defaultAccount?: unknown;
-  };
-  const account = resolveTelegramAccountConfig(cfg, accountId) ?? {};
-
-  // In multi-account setups, channel-level `groups` must NOT be inherited by
-  // accounts that don't have their own `groups` config.  A bot that is not a
-  // member of a configured group will fail when handling group messages, and
-  // this failure disrupts message delivery for *all* accounts.
-  // Single-account setups keep backward compat: channel-level groups still
-  // applies when the account has no override.
-  // See: https://github.com/openclaw/openclaw/issues/30673
-  const configuredAccountIds = Object.keys(cfg.channels?.telegram?.accounts ?? {});
-  const isMultiAccount = configuredAccountIds.length > 1;
-  const groups = account.groups ?? (isMultiAccount ? undefined : channelGroups);
-
-  return { ...base, ...account, groups };
 }
 
 export function createTelegramActionGate(params: {
@@ -198,15 +170,21 @@ export function resolveTelegramAccount(params: {
       name: normalizeOptionalString(merged.name),
       token: tokenResolution.token,
       tokenSource: tokenResolution.source,
+      tokenStatus: tokenResolution.credentialDiagnostics?.length
+        ? "configured_unavailable"
+        : tokenResolution.token
+          ? "available"
+          : "missing",
+      ...(tokenResolution.credentialDiagnostics
+        ? { credentialDiagnostics: tokenResolution.credentialDiagnostics }
+        : {}),
       config: merged,
     } satisfies ResolvedTelegramAccount;
   };
 
-  // If accountId is omitted, prefer a configured account token over failing on
-  // the implicit "default" account. This keeps env-based setups working while
-  // making config-only tokens work for things like heartbeats.
+  const resolvedAccountId = params.accountId ?? resolveDefaultTelegramAccountId(params.cfg);
   return resolveAccountWithDefaultFallback({
-    accountId: params.accountId,
+    accountId: resolvedAccountId,
     normalizeAccountId,
     resolvePrimary: resolve,
     hasCredential: (account) => account.tokenSource !== "none",
@@ -215,7 +193,11 @@ export function resolveTelegramAccount(params: {
 }
 
 export function listEnabledTelegramAccounts(cfg: OpenClawConfig): ResolvedTelegramAccount[] {
+  const baseEnabled = cfg.channels?.telegram?.enabled !== false;
+  if (!baseEnabled) {
+    return [];
+  }
   return listTelegramAccountIds(cfg)
-    .map((accountId) => resolveTelegramAccount({ cfg, accountId }))
-    .filter((account) => account.enabled);
+    .filter((accountId) => mergeTelegramAccountConfig(cfg, accountId).enabled !== false)
+    .map((accountId) => resolveTelegramAccount({ cfg, accountId }));
 }

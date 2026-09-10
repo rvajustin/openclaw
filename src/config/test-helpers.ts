@@ -1,14 +1,15 @@
+// Provides config test helpers for temporary homes and fixture writes.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { withTempHome as withTempHomeBase } from "../../test/helpers/temp-home.js";
+import { withTempHome as withTempHomeBase } from "../plugin-sdk/test-env.js";
 import { resetPluginLoaderTestStateForTest } from "../plugins/loader.test-fixtures.js";
-import { clearPluginSetupRegistryCache } from "../plugins/setup-registry.js";
+import { clearPluginMetadataLifecycleCaches } from "../plugins/plugin-metadata-lifecycle.js";
 import { resetConfigRuntimeState, type OpenClawConfig } from "./config.js";
 
 function resetConfigTestRuntimeState(): void {
   resetConfigRuntimeState();
   resetPluginLoaderTestStateForTest();
-  clearPluginSetupRegistryCache();
+  clearPluginMetadataLifecycleCaches();
 }
 
 export async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
@@ -20,12 +21,13 @@ export async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise
         OPENCLAW_CONFIG_PATH: undefined,
         OPENCLAW_BUNDLED_PLUGINS_DIR: undefined,
         OPENCLAW_DISABLE_BUNDLED_PLUGINS: undefined,
-        OPENCLAW_DISABLE_PLUGIN_DISCOVERY_CACHE: undefined,
-        OPENCLAW_DISABLE_PLUGIN_MANIFEST_CACHE: undefined,
         OPENCLAW_PLUGIN_CATALOG_PATHS: undefined,
         OPENCLAW_MPM_CATALOG_PATHS: undefined,
-        OPENCLAW_PLUGIN_DISCOVERY_CACHE_MS: undefined,
-        OPENCLAW_PLUGIN_MANIFEST_CACHE_MS: undefined,
+        OPENCLAW_LOAD_SHELL_ENV: undefined,
+        OPENCLAW_DEFER_SHELL_ENV_FALLBACK: undefined,
+        OPENCLAW_SHELL_ENV_TIMEOUT_MS: undefined,
+        ANTHROPIC_API_KEY: undefined,
+        ANTHROPIC_OAUTH_TOKEN: undefined,
       },
     });
   } finally {
@@ -65,35 +67,6 @@ export async function withTempHomeConfig<T>(
     const configPath = await writeOpenClawConfig(home, config);
     return fn({ home, configPath });
   });
-}
-
-/**
- * Helper to test env var overrides. Saves/restores env vars for a callback.
- */
-export async function withEnvOverride<T>(
-  overrides: Record<string, string | undefined>,
-  fn: () => Promise<T>,
-): Promise<T> {
-  const saved: Record<string, string | undefined> = {};
-  for (const key of Object.keys(overrides)) {
-    saved[key] = process.env[key];
-    if (overrides[key] === undefined) {
-      delete process.env[key];
-    } else {
-      process.env[key] = overrides[key];
-    }
-  }
-  try {
-    return await fn();
-  } finally {
-    for (const key of Object.keys(saved)) {
-      if (saved[key] === undefined) {
-        delete process.env[key];
-      } else {
-        process.env[key] = saved[key];
-      }
-    }
-  }
 }
 
 export function buildWebSearchProviderConfig(params: {

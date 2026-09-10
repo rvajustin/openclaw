@@ -1,15 +1,19 @@
+/**
+ * Tests OAuth identity and mirroring gates.
+ * Includes direct and fuzz coverage for account/email comparison so refreshed
+ * credentials cannot poison another auth store.
+ */
+import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
 import { describe, expect, it } from "vitest";
+import { createApiKeyCredential } from "./credential-fixtures.test-support.js";
 import {
   isSafeToCopyOAuthIdentity,
-  isSameOAuthIdentity,
   normalizeAuthEmailToken,
   normalizeAuthIdentityToken,
-} from "./oauth.js";
-
-// Direct unit + fuzz tests for the cross-agent credential-mirroring identity
-// gate introduced for #26322 (CWE-284). These helpers are on the hot-path of
-// `mirrorRefreshedCredentialIntoMainStore` and must be strictly correct: a
-// false positive means a sub-agent could poison the main-agent auth store.
+  shouldMirrorRefreshedOAuthCredential,
+} from "./oauth-identity.js";
+import { makeSeededRandom, maybe, randomAsciiString as randomString } from "./oauth-test-utils.js";
+import type { AuthProfileCredential, OAuthCredential } from "./types.js";
 
 describe("normalizeAuthIdentityToken", () => {
   it("returns trimmed value when non-empty", () => {
@@ -48,156 +52,9 @@ describe("normalizeAuthEmailToken", () => {
   });
 });
 
-describe("isSameOAuthIdentity", () => {
-  describe("accountId takes priority when present on both sides", () => {
-    it("returns true when accountIds match", () => {
-      expect(isSameOAuthIdentity({ accountId: "acct-1" }, { accountId: "acct-1" })).toBe(true);
-    });
-
-    it("returns true for accountId match even if emails differ", () => {
-      expect(
-        isSameOAuthIdentity(
-          { accountId: "acct-1", email: "a@example.com" },
-          { accountId: "acct-1", email: "b@example.com" },
-        ),
-      ).toBe(true);
-    });
-
-    it("returns false when accountIds mismatch, ignoring email", () => {
-      expect(
-        isSameOAuthIdentity(
-          { accountId: "acct-1", email: "same@example.com" },
-          { accountId: "acct-2", email: "same@example.com" },
-        ),
-      ).toBe(false);
-    });
-
-    it("treats whitespace-equal accountIds as same", () => {
-      expect(isSameOAuthIdentity({ accountId: "  acct-1  " }, { accountId: "acct-1" })).toBe(true);
-    });
-
-    it("accountId is case-sensitive", () => {
-      expect(isSameOAuthIdentity({ accountId: "Acct-1" }, { accountId: "acct-1" })).toBe(false);
-    });
-  });
-
-  describe("email fallback when accountId missing on either side", () => {
-    it("returns true when emails match (case-insensitive)", () => {
-      expect(
-        isSameOAuthIdentity({ email: "user@example.com" }, { email: "USER@Example.COM" }),
-      ).toBe(true);
-    });
-
-    it("returns false when emails mismatch", () => {
-      expect(isSameOAuthIdentity({ email: "a@example.com" }, { email: "b@example.com" })).toBe(
-        false,
-      );
-    });
-
-    it("matches when main has accountId+email and incoming has only matching email", () => {
-      // Not asymmetric: both sides carry identity (main has more, but
-      // incoming still has email). Email is a shared field with a
-      // matching value — positive-identity match, safe to mirror.
-      expect(
-        isSameOAuthIdentity(
-          { accountId: "acct-1", email: "user@example.com" },
-          { email: "user@example.com" },
-        ),
-      ).toBe(true);
-    });
-
-    it("matches when accountIds on one side are whitespace-only and both sides expose matching email", () => {
-      // Whitespace-only accountId is treated as absent; email falls back
-      // symmetrically on both sides so the positive email match wins.
-      expect(
-        isSameOAuthIdentity(
-          { accountId: "   ", email: "user@example.com" },
-          { accountId: "", email: "USER@example.com" },
-        ),
-      ).toBe(true);
-    });
-  });
-
-  describe("asymmetric identity evidence is refused", () => {
-    it("refuses when main has accountId and incoming has neither", () => {
-      expect(isSameOAuthIdentity({ accountId: "acct-1" }, {})).toBe(false);
-    });
-
-    it("refuses when main has email and incoming has neither", () => {
-      expect(isSameOAuthIdentity({ email: "user@example.com" }, {})).toBe(false);
-    });
-
-    it("refuses when incoming has identity but main does not", () => {
-      expect(isSameOAuthIdentity({}, { accountId: "acct-1" })).toBe(false);
-      expect(isSameOAuthIdentity({}, { email: "user@example.com" })).toBe(false);
-    });
-
-    it("refuses when main has only accountId and incoming has only email (non-overlapping fields)", () => {
-      expect(isSameOAuthIdentity({ accountId: "acct-1" }, { email: "user@example.com" })).toBe(
-        false,
-      );
-    });
-  });
-
-  describe("no identity metadata on either side", () => {
-    it("returns true (no evidence of mismatch) when both sides lack accountId and email", () => {
-      // This matches the looser behaviour of the pre-existing
-      // adoptNewerMainOAuthCredential gate; provider equality is the
-      // caller's responsibility.
-      expect(isSameOAuthIdentity({}, {})).toBe(true);
-    });
-
-    it("returns true when one side has empty strings for both fields", () => {
-      expect(
-        isSameOAuthIdentity(
-          { accountId: "", email: "" },
-          { accountId: undefined, email: undefined },
-        ),
-      ).toBe(true);
-    });
-  });
-
-  describe("reflexivity and symmetry", () => {
-    it("is reflexive: share(a,a) === true for any non-conflicting identity", () => {
-      const a = { accountId: "acct-1", email: "a@example.com" };
-      expect(isSameOAuthIdentity(a, a)).toBe(true);
-    });
-
-    it("is symmetric: share(a,b) === share(b,a)", () => {
-      const a = { accountId: "acct-1" };
-      const b = { accountId: "acct-2" };
-      expect(isSameOAuthIdentity(a, b)).toBe(isSameOAuthIdentity(b, a));
-    });
-  });
-});
-
 // ---------------------------------------------------------------------------
 // Fuzz tests. Seeded Mulberry32 so the run is reproducible.
 // ---------------------------------------------------------------------------
-
-function makeSeededRandom(seed: number): () => number {
-  let t = seed >>> 0;
-  return () => {
-    t = (t + 0x6d2b79f5) >>> 0;
-    let r = t;
-    r = Math.imul(r ^ (r >>> 15), r | 1);
-    r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
-    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function randomString(rng: () => number, maxLen: number): string {
-  const len = Math.floor(rng() * maxLen);
-  const chars: string[] = [];
-  for (let i = 0; i < len; i += 1) {
-    chars.push(String.fromCodePoint(32 + Math.floor(rng() * 95))); // printable ASCII
-  }
-  return chars.join("");
-}
-
-function maybe<T>(rng: () => number, value: T): T | undefined {
-  return rng() < 0.5 ? value : undefined;
-}
 
 describe("isSafeToCopyOAuthIdentity (unified copy gate, used for mirror and adopt)", () => {
   describe("positive matches", () => {
@@ -275,7 +132,7 @@ describe("isSafeToCopyOAuthIdentity (unified copy gate, used for mirror and adop
       ).toBe(false);
     });
 
-    it("accountId is case-sensitive", () => {
+    it("keeps accountId case-sensitive in the copy gate", () => {
       expect(isSafeToCopyOAuthIdentity({ accountId: "X" }, { accountId: "x" })).toBe(false);
     });
   });
@@ -306,53 +163,186 @@ describe("isSafeToCopyOAuthIdentity (unified copy gate, used for mirror and adop
       expect(isSafeToCopyOAuthIdentity(a, a)).toBe(true);
     });
   });
+});
 
-  describe("relationship to the strict isSameOAuthIdentity reference", () => {
-    it("is at least as permissive as the strict rule (strict implies safe-to-copy)", () => {
-      // Pure-symmetric match cases accepted by the strict rule must also
-      // be accepted by the unified copy gate.
-      expect(isSameOAuthIdentity({ accountId: "x" }, { accountId: "x" })).toBe(true);
-      expect(isSafeToCopyOAuthIdentity({ accountId: "x" }, { accountId: "x" })).toBe(true);
-    });
+describe("shouldMirrorRefreshedOAuthCredential", () => {
+  type MirrorCase = {
+    name: string;
+    refreshed?: OAuthCredential;
+    existing: AuthProfileCredential | undefined;
+    shouldMirror: boolean;
+    reason: string;
+  };
+  const refreshed = {
+    type: "oauth",
+    provider: "openai",
+    access: "fresh-access",
+    refresh: "fresh-refresh",
+    expires: 2_000,
+    accountId: "acct-1",
+  } as const;
 
-    it("only relaxes the strict rule in the pure-upgrade direction", () => {
-      // Existing has no identity, incoming has identity: strict refuses,
-      // unified accepts.
-      expect(isSameOAuthIdentity({}, { accountId: "x" })).toBe(false);
-      expect(isSafeToCopyOAuthIdentity({}, { accountId: "x" })).toBe(true);
-    });
+  const cases: MirrorCase[] = [
+    {
+      name: "empty main store",
+      existing: undefined,
+      shouldMirror: true,
+      reason: "no-existing-credential",
+    },
+    {
+      name: "matching older oauth credential",
+      existing: {
+        type: "oauth",
+        provider: "openai",
+        access: "old",
+        refresh: "old-refresh",
+        expires: 1_000,
+        accountId: "acct-1",
+      },
+      shouldMirror: true,
+      reason: "incoming-fresher",
+    },
+    {
+      name: "non-finite existing expiry",
+      existing: {
+        type: "oauth",
+        provider: "openai",
+        access: "old",
+        refresh: "old-refresh",
+        expires: Number.NaN,
+        accountId: "acct-1",
+      },
+      shouldMirror: true,
+      reason: "incoming-fresher",
+    },
+    {
+      name: "out-of-range existing expiry",
+      existing: {
+        type: "oauth",
+        provider: "openai",
+        access: "old",
+        refresh: "old-refresh",
+        expires: MAX_DATE_TIMESTAMP_MS + 1,
+        accountId: "acct-1",
+      },
+      shouldMirror: true,
+      reason: "incoming-fresher",
+    },
+    {
+      name: "out-of-range refreshed expiry",
+      refreshed: {
+        ...refreshed,
+        expires: MAX_DATE_TIMESTAMP_MS + 1,
+      },
+      existing: {
+        type: "oauth",
+        provider: "openai",
+        access: "old",
+        refresh: "old-refresh",
+        expires: 1_000,
+        accountId: "acct-1",
+      },
+      shouldMirror: false,
+      reason: "incoming-not-fresher",
+    },
+    {
+      name: "identity upgrade",
+      existing: {
+        type: "oauth",
+        provider: "openai",
+        access: "old",
+        refresh: "old-refresh",
+        expires: 1_000,
+      },
+      shouldMirror: true,
+      reason: "incoming-fresher",
+    },
+    {
+      name: "api key override",
+      existing: createApiKeyCredential("openai", "operator-key"),
+      shouldMirror: false,
+      reason: "non-oauth-existing-credential",
+    },
+    {
+      name: "provider mismatch",
+      existing: {
+        type: "oauth",
+        provider: "anthropic",
+        access: "old",
+        refresh: "old-refresh",
+        expires: 1_000,
+        accountId: "acct-1",
+      },
+      shouldMirror: false,
+      reason: "provider-mismatch",
+    },
+    {
+      name: "identity mismatch",
+      existing: {
+        type: "oauth",
+        provider: "openai",
+        access: "old",
+        refresh: "old-refresh",
+        expires: 1_000,
+        accountId: "acct-2",
+      },
+      shouldMirror: false,
+      reason: "identity-mismatch-or-regression",
+    },
+    {
+      name: "strictly fresher existing credential",
+      existing: {
+        type: "oauth",
+        provider: "openai",
+        access: "main-fresh",
+        refresh: "main-fresh-refresh",
+        expires: 3_000,
+        accountId: "acct-1",
+      },
+      shouldMirror: false,
+      reason: "incoming-not-fresher",
+    },
+  ];
 
-    it("does NOT relax in the regression direction (strict and unified both refuse)", () => {
-      expect(isSameOAuthIdentity({ accountId: "x" }, {})).toBe(false);
-      expect(isSafeToCopyOAuthIdentity({ accountId: "x" }, {})).toBe(false);
+  it.each(cases)(
+    "returns $reason for $name",
+    ({ existing, refreshed: caseRefreshed, shouldMirror, reason }) => {
+      expect(
+        shouldMirrorRefreshedOAuthCredential({
+          existing,
+          refreshed: caseRefreshed ?? refreshed,
+        }),
+      ).toEqual({ shouldMirror, reason });
+    },
+  );
+
+  it("refuses identity regression from a known-account main credential", () => {
+    expect(
+      shouldMirrorRefreshedOAuthCredential({
+        existing: {
+          type: "oauth",
+          provider: "openai",
+          access: "main-identity-access",
+          refresh: "main-identity-refresh",
+          expires: 1_000,
+          accountId: "acct-main",
+        },
+        refreshed: {
+          type: "oauth",
+          provider: "openai",
+          access: "fresh-access",
+          refresh: "fresh-refresh",
+          expires: 2_000,
+        },
+      }),
+    ).toEqual({
+      shouldMirror: false,
+      reason: "identity-mismatch-or-regression",
     });
   });
 });
+
 describe("isSafeToCopyOAuthIdentity fuzz", () => {
-  function makeSeededRandom(seed: number): () => number {
-    let t = seed >>> 0;
-    return () => {
-      t = (t + 0x6d2b79f5) >>> 0;
-      let r = t;
-      r = Math.imul(r ^ (r >>> 15), r | 1);
-      r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
-      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
-    };
-  }
-
-  function randomString(rng: () => number, maxLen: number): string {
-    const len = Math.floor(rng() * maxLen);
-    const chars: string[] = [];
-    for (let i = 0; i < len; i += 1) {
-      chars.push(String.fromCodePoint(32 + Math.floor(rng() * 95)));
-    }
-    return chars.join("");
-  }
-
-  function maybe<T>(rng: () => number, value: T): T | undefined {
-    return rng() < 0.5 ? value : undefined;
-  }
-
   it("is reflexive: share(a, a) is always true", () => {
     const rng = makeSeededRandom(0x0172_0417);
     for (let i = 0; i < 1000; i += 1) {
@@ -373,24 +363,6 @@ describe("isSafeToCopyOAuthIdentity fuzz", () => {
     }
   });
 
-  it("strict → unified: if isSameOAuthIdentity accepts, isSafeToCopyOAuthIdentity accepts", () => {
-    // Monotonic relaxation property over random inputs.
-    const rng = makeSeededRandom(0x7777_7777);
-    for (let i = 0; i < 1000; i += 1) {
-      const a = {
-        accountId: maybe(rng, randomString(rng, 32)),
-        email: maybe(rng, randomString(rng, 32)),
-      };
-      const b = {
-        accountId: maybe(rng, randomString(rng, 32)),
-        email: maybe(rng, randomString(rng, 32)),
-      };
-      if (isSameOAuthIdentity(a, b)) {
-        expect(isSafeToCopyOAuthIdentity(a, b)).toBe(true);
-      }
-    }
-  });
-
   it("unified rule never refuses a same-account pair and never accepts a different-account pair", () => {
     // Over random identity pairs that share accountId but vary in every
     // other field, the gate must always accept. Over pairs with distinct
@@ -407,59 +379,6 @@ describe("isSafeToCopyOAuthIdentity fuzz", () => {
         email: maybe(rng, randomString(rng, 32)),
       };
       expect(isSafeToCopyOAuthIdentity(a, b)).toBe(true);
-    }
-  });
-});
-
-describe("isSameOAuthIdentity fuzz", () => {
-  it("is always symmetric regardless of input shape", () => {
-    const rng = makeSeededRandom(0x0426_0417);
-    for (let i = 0; i < 1000; i += 1) {
-      const a = {
-        accountId: maybe(rng, randomString(rng, 64)),
-        email: maybe(rng, randomString(rng, 64)),
-      };
-      const b = {
-        accountId: maybe(rng, randomString(rng, 64)),
-        email: maybe(rng, randomString(rng, 64)),
-      };
-      expect(isSameOAuthIdentity(a, b)).toBe(isSameOAuthIdentity(b, a));
-    }
-  });
-
-  it("is always reflexive: share(a, a) is true", () => {
-    const rng = makeSeededRandom(0x1234_abcd);
-    for (let i = 0; i < 1000; i += 1) {
-      const a = {
-        accountId: maybe(rng, randomString(rng, 64)),
-        email: maybe(rng, randomString(rng, 64)),
-      };
-      expect(isSameOAuthIdentity(a, a)).toBe(true);
-    }
-  });
-
-  it("never returns true for distinct non-empty accountIds (regardless of email)", () => {
-    const rng = makeSeededRandom(0xfeedc0de);
-    for (let i = 0; i < 500; i += 1) {
-      const idA = `A-${randomString(rng, 32) || "x"}`;
-      const idB = `B-${randomString(rng, 32) || "y"}`;
-      // Shared email; mismatched accountId must still refuse.
-      const email = `${randomString(rng, 16) || "u"}@example.com`;
-      expect(isSameOAuthIdentity({ accountId: idA, email }, { accountId: idB, email })).toBe(false);
-    }
-  });
-
-  it("email comparison is case-insensitive for random email bodies", () => {
-    const rng = makeSeededRandom(0xcafef00d);
-    for (let i = 0; i < 500; i += 1) {
-      const local = randomString(rng, 16).replace(/[^A-Za-z0-9+._-]/g, "") || "user";
-      const domain = (randomString(rng, 12).replace(/[^A-Za-z0-9.-]/g, "") || "example") + ".com";
-      const email = `${local}@${domain}`;
-      const randomizedCase = email
-        .split("")
-        .map((c) => (rng() < 0.5 ? c.toUpperCase() : c.toLowerCase()))
-        .join("");
-      expect(isSameOAuthIdentity({ email }, { email: randomizedCase })).toBe(true);
     }
   });
 });

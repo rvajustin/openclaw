@@ -1,8 +1,14 @@
+// Builds overview table rows for `openclaw status` and `openclaw status --all`.
+// The row builders combine scan surfaces with health/session summaries while keeping rendering elsewhere.
+
 import { formatCliCommand } from "../cli/command-format.js";
+import { resolveIsNixMode } from "../config/paths.js";
+import { isTruthyEnvValue } from "../infra/env.js";
 import type { HeartbeatEventPayload } from "../infra/heartbeat-events.js";
-import type { Tone } from "../memory-host-sdk/status.js";
 import type { PluginCompatibilityNotice } from "../plugins/status.js";
+import type { StatusSummary } from "../status/types.js";
 import { VERSION } from "../version.js";
+import { buildBackupStatusValue, readBackupFreshness } from "./backup-health.js";
 import type { HealthSummary } from "./health.js";
 import {
   buildStatusOverviewRowsFromSurface,
@@ -15,6 +21,7 @@ import {
   buildStatusProbesValue,
   buildStatusSecretsValue,
   buildStatusSessionsOverviewValue,
+  formatHostDesktopStatus,
 } from "./status-overview-values.ts";
 import type { AgentLocalStatus } from "./status.agent-local.js";
 import {
@@ -23,47 +30,84 @@ import {
   buildStatusLastHeartbeatValue,
   buildStatusMemoryValue,
   buildStatusTasksValue,
+  type StatusMemoryStateResolvers,
 } from "./status.command-sections.js";
 import type { MemoryPluginStatus, MemoryStatusSnapshot } from "./status.scan.shared.js";
-import type { StatusSummary } from "./status.types.js";
 
-export function buildStatusCommandOverviewRows(params: {
-  opts: {
-    deep?: boolean;
-  };
-  surface: StatusOverviewSurface;
-  osLabel: string;
-  summary: StatusSummary;
-  health?: HealthSummary;
-  lastHeartbeat: HeartbeatEventPayload | null;
-  agentStatus: {
-    defaultId?: string | null;
-    bootstrapPendingCount: number;
-    totalSessions: number;
-    agents: AgentLocalStatus[];
-  };
-  memory: MemoryStatusSnapshot | null;
-  memoryPlugin: MemoryPluginStatus;
-  pluginCompatibility: PluginCompatibilityNotice[];
-  ok: (value: string) => string;
-  warn: (value: string) => string;
-  muted: (value: string) => string;
-  formatTimeAgo: (ageMs: number) => string;
-  formatKTokens: (value: number) => string;
-  resolveMemoryVectorState: (value: NonNullable<MemoryStatusSnapshot["vector"]>) => {
-    state: string;
-    tone: Tone;
-  };
-  resolveMemoryFtsState: (value: NonNullable<MemoryStatusSnapshot["fts"]>) => {
-    state: string;
-    tone: Tone;
-  };
-  resolveMemoryCacheSummary: (value: NonNullable<MemoryStatusSnapshot["cache"]>) => {
-    text: string;
-    tone: Tone;
-  };
-  updateValue?: string;
-}) {
+type StatusDegradationSummary = Pick<
+  StatusSummary,
+  "degradedSecretOwners" | "degradedPlugins" | "startupMigrationWarning" | "secretEgressProxy"
+>;
+
+function buildStatusDegradationRows(
+  summary: StatusDegradationSummary,
+  decorate = (value: string) => value,
+) {
+  const rows: Array<{ Item: string; Value: string }> = [];
+  if (summary.startupMigrationWarning) {
+    rows.push({ Item: "Startup migrations", Value: decorate(summary.startupMigrationWarning) });
+  }
+  if (summary.secretEgressProxy) {
+    const status = summary.secretEgressProxy;
+    rows.push({
+      Item: "Secret egress proxy",
+      Value:
+        status.state === "ready"
+          ? `ready · CA expires ${status.caExpiresAt}`
+          : decorate(status.message ?? "Certificate preparation unavailable"),
+    });
+  }
+  const secretOwners = summary.degradedSecretOwners ?? [];
+  if (secretOwners.length > 0) {
+    rows.push({
+      Item: "Degraded secrets",
+      Value: decorate(
+        `${secretOwners.length} degraded · ${secretOwners.map((owner) => `${owner.ownerKind}:${owner.ownerId}`).join(", ")}`,
+      ),
+    });
+  }
+  const plugins = summary.degradedPlugins ?? [];
+  if (plugins.length > 0) {
+    rows.push({
+      Item: "Degraded plugins",
+      Value: decorate(
+        `${plugins.length} configured-unavailable · ${plugins.map((plugin) => plugin.pluginId).join(", ")}`,
+      ),
+    });
+  }
+  return rows;
+}
+
+/** Builds the default `openclaw status` overview rows from scan, health, memory, and session inputs. */
+export function buildStatusCommandOverviewRows(
+  params: {
+    env: NodeJS.ProcessEnv;
+    opts: {
+      deep?: boolean;
+    };
+    surface: StatusOverviewSurface;
+    osLabel: string;
+    summary: StatusSummary;
+    health?: HealthSummary;
+    lastHeartbeat: HeartbeatEventPayload | null;
+    agentStatus: {
+      defaultId?: string | null;
+      bootstrapPendingCount: number;
+      totalSessions: number;
+      agents: AgentLocalStatus[];
+    };
+    memory: MemoryStatusSnapshot | null;
+    memoryPlugin: MemoryPluginStatus;
+    pluginCompatibility: PluginCompatibilityNotice[];
+    ok: (value: string) => string;
+    warn: (value: string) => string;
+    muted: (value: string) => string;
+    formatTimeAgo: (ageMs: number) => string;
+    formatKTokens: (value: number) => string;
+    updateValue?: string;
+    updateRows?: Array<{ Item: string; Value: string }>;
+  } & StatusMemoryStateResolvers,
+) {
   const agentsValue = buildStatusAgentsValue({
     agentStatus: params.agentStatus,
     formatTimeAgo: params.formatTimeAgo,
@@ -99,13 +143,26 @@ export function buildStatusCommandOverviewRows(params: {
     resolveMemoryVectorState: params.resolveMemoryVectorState,
     resolveMemoryFtsState: params.resolveMemoryFtsState,
     resolveMemoryCacheSummary: params.resolveMemoryCacheSummary,
+    memoryUnavailableLabel: "not checked",
   });
   const pluginCompatibilityValue = buildStatusPluginCompatibilityValue({
     notices: params.pluginCompatibility,
     ok: params.ok,
     warn: params.warn,
   });
-
+  const updatesDisabled =
+    params.surface.cfg.update?.checkOnStart === false ||
+    isTruthyEnvValue(params.env.OPENCLAW_NO_AUTO_UPDATE) ||
+    resolveIsNixMode(params.env);
+  const doNotTrack = params.env.DO_NOT_TRACK?.trim().toLowerCase();
+  const telemetryValue = updatesDisabled
+    ? params.muted("disabled · update checks off")
+    : doNotTrack === "1" || doNotTrack === "true"
+      ? params.muted("disabled (DO_NOT_TRACK)")
+      : params.surface.cfg.telemetry?.enabled === true
+        ? params.ok("enabled · anonymous feature stats")
+        : params.muted("disabled · update checks only");
+  const hostDesktopValue = formatHostDesktopStatus(params.summary.hostDesktop);
   return buildStatusOverviewRowsFromSurface({
     surface: params.surface,
     decorateOk: params.ok,
@@ -116,11 +173,28 @@ export function buildStatusCommandOverviewRows(params: {
     updateValue: params.updateValue,
     agentsValue,
     suffixRows: [
+      ...(params.updateRows ?? []),
+      { Item: "Telemetry", Value: telemetryValue },
       { Item: "Memory", Value: memoryValue },
+      {
+        Item: "Host desktop",
+        Value:
+          (params.summary.hostDesktop?.state ?? "disabled") === "disabled"
+            ? params.muted(hostDesktopValue)
+            : hostDesktopValue,
+      },
+      ...buildStatusDegradationRows(params.summary, params.warn),
       { Item: "Plugin compatibility", Value: pluginCompatibilityValue },
       { Item: "Probes", Value: probesValue },
       { Item: "Events", Value: eventsValue },
       { Item: "Tasks", Value: tasksValue },
+      {
+        Item: "Backups",
+        Value: buildBackupStatusValue({
+          freshness: readBackupFreshness(params.env),
+          formatTimeAgo: params.formatTimeAgo,
+        }),
+      },
       { Item: "Heartbeat", Value: heartbeatValue },
       ...(lastHeartbeatValue ? [{ Item: "Last heartbeat", Value: lastHeartbeatValue }] : []),
       {
@@ -137,11 +211,14 @@ export function buildStatusCommandOverviewRows(params: {
   });
 }
 
+/** Builds the expanded status-all overview rows, including config and security hints. */
 export function buildStatusAllOverviewRows(params: {
   surface: StatusOverviewSurface;
+  summary: StatusDegradationSummary;
   osLabel: string;
   configPath: string;
   secretDiagnosticsCount: number;
+  updateRows?: Array<{ Item: string; Value: string }>;
   agentStatus: {
     bootstrapPendingCount: number;
     totalSessions: number;
@@ -165,7 +242,9 @@ export function buildStatusAllOverviewRows(params: {
       { Item: "Config", Value: params.configPath },
     ],
     middleRows: [
+      ...(params.updateRows ?? []),
       { Item: "Security", Value: `Run: ${formatCliCommand("openclaw security audit --deep")}` },
+      ...buildStatusDegradationRows(params.summary),
     ],
     agentsValue: buildStatusAllAgentsValue({
       agentStatus: params.agentStatus,

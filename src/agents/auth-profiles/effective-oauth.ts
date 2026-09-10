@@ -1,43 +1,29 @@
-import { log } from "./constants.js";
-import {
-  hasUsableOAuthCredential,
-  readExternalCliBootstrapCredential,
-  shouldBootstrapFromExternalCliCredential,
-} from "./external-cli-sync.js";
-import type { OAuthCredential } from "./types.js";
+/**
+ * Effective OAuth credential resolver.
+ * Delegates to the managed OAuth selector while allowing external CLI
+ * bootstrap credentials to fill unusable local profile state.
+ */
+import { readExternalCliBootstrapCredential } from "./external-cli-sync.js";
+import { resolveEffectiveOAuthCredentialCore } from "./oauth-manager.js";
+import type { AuthProfileStore, OAuthCredential } from "./types.js";
 
+/** Resolves the effective OAuth credential, optionally reading external CLI bootstrap state. */
 export function resolveEffectiveOAuthCredential(params: {
+  store: AuthProfileStore;
   profileId: string;
   credential: OAuthCredential;
+  allowKeychainPrompt?: boolean;
 }): OAuthCredential {
-  const imported = readExternalCliBootstrapCredential({
+  return resolveEffectiveOAuthCredentialCore({
+    store: params.store,
     profileId: params.profileId,
     credential: params.credential,
+    readBootstrapCredential: ({ store, profileId, credential }) =>
+      readExternalCliBootstrapCredential({
+        store,
+        profileId,
+        credential,
+        allowKeychainPrompt: params.allowKeychainPrompt ?? false,
+      }),
   });
-  if (!imported) {
-    return params.credential;
-  }
-  if (hasUsableOAuthCredential(params.credential)) {
-    log.debug("resolved oauth credential from canonical local store", {
-      profileId: params.profileId,
-      provider: params.credential.provider,
-      localExpires: params.credential.expires,
-      externalExpires: imported.expires,
-    });
-    return params.credential;
-  }
-  const shouldBootstrap = shouldBootstrapFromExternalCliCredential({
-    existing: params.credential,
-    imported,
-  });
-  if (shouldBootstrap) {
-    log.debug("resolved oauth credential from external cli bootstrap", {
-      profileId: params.profileId,
-      provider: imported.provider,
-      localExpires: params.credential.expires,
-      externalExpires: imported.expires,
-    });
-    return imported;
-  }
-  return params.credential;
 }

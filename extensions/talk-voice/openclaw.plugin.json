@@ -1,5 +1,9 @@
 {
   "id": "talk-voice",
+  "categories": ["voice", "tools"],
+  "activation": {
+    "onStartup": true
+  },
   "enabledByDefault": true,
   "name": "Talk Voice",
   "description": "Manage Talk voice selection (list/set).",

@@ -1,112 +1,46 @@
+// Config-only channel status formatter used when the gateway is unreachable.
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import { formatDocsLink } from "../../../packages/terminal-core/src/links.js";
+import { theme } from "../../../packages/terminal-core/src/theme.js";
 import {
   hasConfiguredUnavailableCredentialStatus,
   hasResolvedCredentialValue,
 } from "../../channels/account-snapshot-fields.js";
-import { listChannelPlugins } from "../../channels/plugins/index.js";
+import { normalizeChannelId } from "../../channels/plugins/index.js";
+import { listReadOnlyChannelPluginsForConfig } from "../../channels/plugins/read-only.js";
 import {
-  buildChannelAccountSnapshot,
+  resolveChannelAccountSnapshot,
   buildReadOnlySourceChannelAccountSnapshot,
 } from "../../channels/plugins/status.js";
 import type { ChannelAccountSnapshot } from "../../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
-import { formatDocsLink } from "../../terminal/links.js";
-import { theme } from "../../terminal/theme.js";
+import { listExplicitConfiguredChannelIdsForConfig } from "../../plugins/channel-plugin-ids.js";
+import { resolveMissingOfficialExternalChannelPluginRepairHints } from "../../plugins/official-external-plugin-repair-hints.js";
+import {
+  appendBaseUrlBit,
+  appendEnabledConfiguredLinkedBits,
+  appendModeBit,
+  appendTokenSourceBits,
+  buildChannelAccountLine,
+  type ChatChannel,
+  NO_CONFIGURED_CHAT_CHANNELS_LINE,
+} from "./shared.js";
 
-type ChatChannel = string;
+type ChannelStatusPluginLabel = {
+  id: ChatChannel;
+  meta: { label?: string };
+};
 
-function formatAccountLabel(params: { accountId: string; name?: string }) {
-  const base = params.accountId || "default";
-  if (params.name?.trim()) {
-    return `${base} (${params.name.trim()})`;
-  }
-  return base;
-}
-
-function formatChannelAccountLabel(params: {
-  channel: ChatChannel;
-  accountId: string;
-  name?: string;
-}): string {
-  const channelText =
-    listChannelPlugins().find((plugin) => plugin.id === params.channel)?.meta.label ??
-    params.channel;
-  return `${channelText} ${formatAccountLabel({
-    accountId: params.accountId,
-    name: params.name,
-  })}`;
-}
-
-function appendEnabledConfiguredLinkedBits(bits: string[], account: Record<string, unknown>) {
-  if (typeof account.enabled === "boolean") {
-    bits.push(account.enabled ? "enabled" : "disabled");
-  }
-  if (typeof account.configured === "boolean") {
-    if (account.configured) {
-      bits.push("configured");
-      if (hasConfiguredUnavailableCredentialStatus(account)) {
-        bits.push("secret unavailable in this command path");
-      }
-    } else {
-      bits.push("not configured");
-    }
-  }
-  if (typeof account.linked === "boolean") {
-    bits.push(account.linked ? "linked" : "not linked");
-  }
-}
-
-function appendModeBit(bits: string[], account: Record<string, unknown>) {
-  if (typeof account.mode === "string" && account.mode.length > 0) {
-    bits.push(`mode:${account.mode}`);
-  }
-}
-
-function appendTokenSourceBits(bits: string[], account: Record<string, unknown>) {
-  const appendSourceBit = (label: string, sourceKey: string, statusKey: string) => {
-    const source = account[sourceKey];
-    if (typeof source !== "string" || !source || source === "none") {
-      return;
-    }
-    const status = account[statusKey];
-    const unavailable = status === "configured_unavailable" ? " (unavailable)" : "";
-    bits.push(`${label}:${source}${unavailable}`);
-  };
-
-  appendSourceBit("token", "tokenSource", "tokenStatus");
-  appendSourceBit("bot", "botTokenSource", "botTokenStatus");
-  appendSourceBit("app", "appTokenSource", "appTokenStatus");
-  appendSourceBit("signing", "signingSecretSource", "signingSecretStatus");
-}
-
-function appendBaseUrlBit(bits: string[], account: Record<string, unknown>) {
-  if (typeof account.baseUrl === "string" && account.baseUrl) {
-    bits.push(`url:${account.baseUrl}`);
-  }
-}
-
-function buildChannelAccountLine(
-  provider: ChatChannel,
-  account: Record<string, unknown>,
-  bits: string[],
-): string {
-  const accountId = typeof account.accountId === "string" ? account.accountId : "default";
-  const name = normalizeOptionalString(account.name) ?? "";
-  const labelText = formatChannelAccountLabel({
-    channel: provider,
-    accountId,
-    name: name || undefined,
-  });
-  return `- ${labelText}: ${bits.join(", ")}`;
-}
-
+/** Render channel status lines from config snapshots without calling the gateway. */
 export async function formatConfigChannelsStatusLines(
   cfg: OpenClawConfig,
   meta: { path?: string; mode?: "local" | "remote" },
-  opts?: { sourceConfig?: OpenClawConfig },
+  opts?: { sourceConfig?: OpenClawConfig; channel?: string; fallbackReason?: string },
 ): Promise<string[]> {
   const lines: string[] = [];
-  lines.push(theme.warn("Gateway not reachable; showing config-only status."));
+  lines.push(
+    theme.warn(opts?.fallbackReason ?? "Gateway not reachable; showing config-only status."),
+  );
   if (meta.path) {
     lines.push(`Config: ${meta.path}`);
   }
@@ -117,19 +51,33 @@ export async function formatConfigChannelsStatusLines(
     lines.push("");
   }
 
-  const accountLines = (provider: ChatChannel, accounts: Array<Record<string, unknown>>) =>
+  const accountLines = (
+    plugin: ChannelStatusPluginLabel,
+    accounts: Array<Record<string, unknown>>,
+  ) =>
     accounts.map((account) => {
       const bits: string[] = [];
       appendEnabledConfiguredLinkedBits(bits, account);
       appendModeBit(bits, account);
       appendTokenSourceBits(bits, account);
       appendBaseUrlBit(bits, account);
-      return buildChannelAccountLine(provider, account, bits);
+      return buildChannelAccountLine(plugin.id, account, bits, {
+        channelLabel: plugin.meta.label ?? plugin.id,
+      });
     });
 
-  const plugins = listChannelPlugins();
   const sourceConfig = opts?.sourceConfig ?? cfg;
+  const requestedChannel = opts?.channel
+    ? (normalizeChannelId(opts.channel) ?? normalizeOptionalLowercaseString(opts.channel))
+    : null;
+  const plugins = listReadOnlyChannelPluginsForConfig(cfg, {
+    activationSourceConfig: sourceConfig,
+    includeSetupFallbackPlugins: true,
+  }).filter((plugin) => !requestedChannel || plugin.id === requestedChannel);
+  const visibleChannelIds = new Set<string>();
+  const statusLinesStart = lines.length;
   for (const plugin of plugins) {
+    visibleChannelIds.add(plugin.id);
     const accountIds = plugin.config.listAccountIds(cfg);
     if (!accountIds.length) {
       continue;
@@ -141,7 +89,7 @@ export async function formatConfigChannelsStatusLines(
         cfg: sourceConfig,
         accountId,
       });
-      const resolvedSnapshot = await buildChannelAccountSnapshot({
+      const resolvedSnapshot = await resolveChannelAccountSnapshot({
         plugin,
         cfg,
         accountId,
@@ -156,13 +104,38 @@ export async function formatConfigChannelsStatusLines(
       );
     }
     if (snapshots.length > 0) {
-      lines.push(...accountLines(plugin.id, snapshots));
+      lines.push(...accountLines(plugin, snapshots));
     }
+  }
+
+  const missingChannelIds = [
+    ...new Set([
+      ...listExplicitConfiguredChannelIdsForConfig(sourceConfig),
+      ...listExplicitConfiguredChannelIdsForConfig(cfg),
+    ]),
+  ].filter(
+    (channelId) =>
+      (!requestedChannel || channelId === requestedChannel) && !visibleChannelIds.has(channelId),
+  );
+  const missingHints = resolveMissingOfficialExternalChannelPluginRepairHints({
+    config: cfg,
+    activationSourceConfig: sourceConfig,
+    channelIds: missingChannelIds,
+  });
+  if (missingHints.length > 0) {
+    lines.push("");
+    lines.push(theme.warn("Missing official external plugins:"));
+    for (const hint of missingHints) {
+      lines.push(`- ${hint.label}: ${hint.repairHint}`);
+    }
+  }
+  if (lines.length === statusLinesStart) {
+    lines.push(theme.muted(NO_CONFIGURED_CHAT_CHANNELS_LINE));
   }
 
   lines.push("");
   lines.push(
-    `Tip: ${formatDocsLink("/cli#status", "status --deep")} adds gateway health probes to status output (requires a reachable gateway).`,
+    `Tip: ${formatDocsLink("/cli/status", "status --deep")} adds gateway health probes to status output (requires a reachable gateway).`,
   );
   return lines;
 }
